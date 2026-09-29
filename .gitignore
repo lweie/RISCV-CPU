@@ -1,0 +1,33 @@
+# Vivado
+.Xil/
+*.jou
+*.log
+*.str
+*.wdb
+
+*.cache/
+*.gen/
+*.runs/
+*.sim/
+*.ip_user_files/
+
+# FPGA generated files
+*.bit
+*.ltx
+*.dcp
+
+# Verilator
+obj_dir/
+
+# C/C++ build files
+build/
+*.o
+*.elf
+*.bin
+
+# VS Code
+.vscode/
+
+# OS
+.DS_Store
+Thumbs.db
