@@ -1,4 +1,4 @@
-// 执行阶段：数据前递、ALU运算和控制转移判断
+// 执行阶段：数据前递、RV32M运算和控制转移判断
 module EX_stage (
     input  wire        clk,
     input  wire        reset,
@@ -22,6 +22,13 @@ module EX_stage (
     input  wire [2:0]  id_ex_branch_type,
     input  wire [1:0]  id_ex_jump_type,
     input  wire [1:0]  id_ex_wb_sel,
+    input  wire        id_ex_is_mul,
+    input  wire [1:0]  id_ex_mul_op,
+    input  wire        id_ex_is_div,
+    input  wire [1:0]  id_ex_div_op,
+    input  wire        id_ex_predicted_taken,
+    input  wire [31:0] id_ex_predicted_target,
+    input  wire [31:0] id_ex_predicted_next_pc,
 
     input  wire        forward_ex_mem_valid,
     input  wire [4:0]  forward_ex_mem_rd,
@@ -29,6 +36,26 @@ module EX_stage (
     input  wire        forward_mem_wb_valid,
     input  wire [4:0]  forward_mem_wb_rd,
     input  wire [31:0] forward_mem_wb_data,
+
+    output wire [31:0] mul_operand_a,
+    output wire [31:0] mul_operand_b,
+    output wire [1:0]  mul_op,
+    input  wire [31:0] mul_result,
+
+    output wire        div_start,
+    output wire [31:0] div_dividend,
+    output wire [31:0] div_divisor,
+    output wire [1:0]  div_op,
+    input  wire        div_busy,
+    input  wire        div_done,
+    input  wire [31:0] div_result,
+    output wire        divider_stall,
+
+    output reg         predictor_update_valid,
+    output reg  [1:0]  predictor_update_type,
+    output reg  [31:0] predictor_update_pc,
+    output reg         predictor_actual_taken,
+    output reg  [31:0] predictor_actual_target,
 
     output reg         redirect_valid,
     output reg  [31:0] redirect_pc,
@@ -67,6 +94,11 @@ module EX_stage (
     localparam JUMP_JAL  = 2'b01;
     localparam JUMP_JALR = 2'b10;
 
+    localparam UPDATE_NONE   = 2'b00;
+    localparam UPDATE_BRANCH = 2'b01;
+    localparam UPDATE_JAL    = 2'b10;
+    localparam UPDATE_JALR   = 2'b11;
+
     localparam WB_PC4 = 2'b10;
 
     reg [31:0] rs1_forwarded;
@@ -74,7 +106,13 @@ module EX_stage (
     reg [31:0] alu_operand_a;
     reg [31:0] alu_operand_b;
     reg [31:0] alu_result;
+    reg [31:0] execution_result;
     reg        branch_taken;
+    reg        actual_taken;
+    reg [31:0] actual_target;
+    reg [31:0] actual_next_pc;
+    reg [1:0]  control_type;
+    reg        prediction_metadata_consistent;
 
     // Load结果在MEM/WB阶段前递，EX/MEM只前递已生成的数据
     assign ex_mem_forward_valid = ex_mem_valid && ex_mem_reg_write &&
@@ -138,6 +176,27 @@ module EX_stage (
         endcase
     end
 
+    assign mul_operand_a = rs1_forwarded;
+    assign mul_operand_b = rs2_forwarded;
+    assign mul_op        = id_ex_mul_op;
+
+    assign div_start    = id_ex_valid && id_ex_is_div &&
+                          !div_busy && !div_done;
+    assign div_dividend = rs1_forwarded;
+    assign div_divisor  = rs2_forwarded;
+    assign div_op       = id_ex_div_op;
+    assign divider_stall = id_ex_valid && id_ex_is_div && !div_done;
+
+    // RV32M结果沿用普通ALU的EX/MEM和Forwarding数据通路
+    always @(*) begin
+        if (id_ex_is_mul)
+            execution_result = mul_result;
+        else if (id_ex_is_div)
+            execution_result = div_result;
+        else
+            execution_result = alu_result;
+    end
+
     // 分支比较使用前递后的两个源操作数
     always @(*) begin
         branch_taken = 1'b0;
@@ -154,29 +213,67 @@ module EX_stage (
         endcase
     end
 
-    // Branch、JAL和JALR均在EX阶段确定重定向地址
+    // EX阶段生成真实控制流结果
     always @(*) begin
-        redirect_valid = 1'b0;
-        redirect_pc    = 32'b0;
+        actual_taken  = 1'b0;
+        actual_target = id_ex_pc + 32'd4;
+        actual_next_pc = id_ex_pc + 32'd4;
+        control_type  = UPDATE_NONE;
 
-        if (id_ex_valid) begin
-            if (id_ex_jump_type == JUMP_JAL) begin
-                redirect_valid = 1'b1;
-                redirect_pc    = id_ex_pc + id_ex_imm;
-            end else if (id_ex_jump_type == JUMP_JALR) begin
-                redirect_valid = 1'b1;
-                redirect_pc    = (rs1_forwarded + id_ex_imm) &
-                                 32'hffff_fffe;
-            end else if (id_ex_branch && branch_taken) begin
-                redirect_valid = 1'b1;
-                redirect_pc    = id_ex_pc + id_ex_imm;
-            end
+        if (id_ex_branch) begin
+            actual_taken  = branch_taken;
+            actual_target = id_ex_pc + id_ex_imm;
+            actual_next_pc = branch_taken ? actual_target :
+                                           (id_ex_pc + 32'd4);
+            control_type = UPDATE_BRANCH;
+        end else if (id_ex_jump_type == JUMP_JAL) begin
+            actual_taken  = 1'b1;
+            actual_target = id_ex_pc + id_ex_imm;
+            actual_next_pc = actual_target;
+            control_type = UPDATE_JAL;
+        end else if (id_ex_jump_type == JUMP_JALR) begin
+            actual_taken  = 1'b1;
+            actual_target = (rs1_forwarded + id_ex_imm) &
+                            32'hffff_fffe;
+            actual_next_pc = actual_target;
+            control_type = UPDATE_JALR;
         end
     end
 
-    // EX/MEM流水寄存器
+    // predicted_next_pc同时覆盖方向和目标地址预测错误
+    always @(*) begin
+        prediction_metadata_consistent =
+            id_ex_predicted_taken ?
+            (id_ex_predicted_target == id_ex_predicted_next_pc) :
+            (id_ex_predicted_next_pc == (id_ex_pc + 32'd4));
+
+        redirect_valid = id_ex_valid && (control_type != UPDATE_NONE) &&
+                         ((id_ex_predicted_next_pc != actual_next_pc) ||
+                          !prediction_metadata_consistent);
+        redirect_pc = actual_next_pc;
+
+        predictor_update_valid  = id_ex_valid &&
+                                  (control_type != UPDATE_NONE);
+        predictor_update_type   = control_type;
+        predictor_update_pc     = id_ex_pc;
+        predictor_actual_taken  = actual_taken;
+        predictor_actual_target = actual_target;
+    end
+
+    // EX/MEM流水寄存器，Divider等待周期只向下游发送bubble
     always @(posedge clk) begin
         if (reset) begin
+            ex_mem_valid      <= 1'b0;
+            ex_mem_rd         <= 5'b0;
+            ex_mem_alu_result <= 32'b0;
+            ex_mem_store_data <= 32'b0;
+            ex_mem_pc4        <= 32'b0;
+            ex_mem_reg_write  <= 1'b0;
+            ex_mem_mem_read   <= 1'b0;
+            ex_mem_mem_write  <= 1'b0;
+            ex_mem_mem_type   <= 3'b0;
+            ex_mem_wb_sel     <= 2'b0;
+        end else if (id_ex_valid && id_ex_is_div && !div_done) begin
             ex_mem_valid      <= 1'b0;
             ex_mem_rd         <= 5'b0;
             ex_mem_alu_result <= 32'b0;
@@ -190,7 +287,7 @@ module EX_stage (
         end else begin
             ex_mem_valid      <= id_ex_valid;
             ex_mem_rd         <= id_ex_rd;
-            ex_mem_alu_result <= alu_result;
+            ex_mem_alu_result <= execution_result;
             ex_mem_store_data <= rs2_forwarded;
             ex_mem_pc4        <= id_ex_pc + 32'd4;
             ex_mem_reg_write  <= id_ex_valid && id_ex_reg_write;

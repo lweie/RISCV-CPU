@@ -6,8 +6,12 @@ module ID_stage (
     input  wire        if_id_valid,
     input  wire [31:0] if_id_pc,
     input  wire [31:0] if_id_instr,
+    input  wire        if_id_predicted_taken,
+    input  wire [31:0] if_id_predicted_target,
+    input  wire [31:0] if_id_predicted_next_pc,
 
     input  wire        flush,
+    input  wire        divider_stall,
     output wire        stall,
 
     input  wire        wb_reg_write,
@@ -32,7 +36,14 @@ module ID_stage (
     output reg         id_ex_branch,
     output reg  [2:0]  id_ex_branch_type,
     output reg  [1:0]  id_ex_jump_type,
-    output reg  [1:0]  id_ex_wb_sel
+    output reg  [1:0]  id_ex_wb_sel,
+    output reg         id_ex_is_mul,
+    output reg  [1:0]  id_ex_mul_op,
+    output reg         id_ex_is_div,
+    output reg  [1:0]  id_ex_div_op,
+    output reg         id_ex_predicted_taken,
+    output reg  [31:0] id_ex_predicted_target,
+    output reg  [31:0] id_ex_predicted_next_pc
 );
 
     localparam ALU_ADD  = 4'd0;
@@ -77,6 +88,10 @@ module ID_stage (
     reg [2:0]  dec_branch_type;
     reg [1:0]  dec_jump_type;
     reg [1:0]  dec_wb_sel;
+    reg        dec_is_mul;
+    reg [1:0]  dec_mul_op;
+    reg        dec_is_div;
+    reg [1:0]  dec_div_op;
     reg        dec_uses_rs1;
     reg        dec_uses_rs2;
 
@@ -115,6 +130,10 @@ module ID_stage (
         dec_branch_type = 3'b0;
         dec_jump_type   = JUMP_NONE;
         dec_wb_sel      = WB_ALU;
+        dec_is_mul      = 1'b0;
+        dec_mul_op      = 2'b0;
+        dec_is_div      = 1'b0;
+        dec_div_op      = 2'b0;
         dec_uses_rs1    = 1'b0;
         dec_uses_rs2    = 1'b0;
 
@@ -123,63 +142,75 @@ module ID_stage (
                 dec_uses_rs1  = 1'b1;
                 dec_uses_rs2  = 1'b1;
                 dec_reg_write = 1'b1;
-                case (if_id_instr[14:12])
-                    3'b000: begin
-                        if (if_id_instr[31:25] == 7'b0000000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_ADD;
-                        end else if (if_id_instr[31:25] == 7'b0100000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_SUB;
-                        end
+                if (if_id_instr[31:25] == 7'b0000001) begin
+                    // RV32M使用funct3区分乘法与除法操作
+                    dec_valid = 1'b1;
+                    if (if_id_instr[14:12] <= 3'b011) begin
+                        dec_is_mul = 1'b1;
+                        dec_mul_op = if_id_instr[13:12];
+                    end else begin
+                        dec_is_div = 1'b1;
+                        dec_div_op = if_id_instr[13:12];
                     end
-                    3'b001: begin
-                        if (if_id_instr[31:25] == 7'b0000000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_SLL;
+                end else begin
+                    case (if_id_instr[14:12])
+                        3'b000: begin
+                            if (if_id_instr[31:25] == 7'b0000000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_ADD;
+                            end else if (if_id_instr[31:25] == 7'b0100000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_SUB;
+                            end
                         end
-                    end
-                    3'b010: begin
-                        if (if_id_instr[31:25] == 7'b0000000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_SLT;
+                        3'b001: begin
+                            if (if_id_instr[31:25] == 7'b0000000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_SLL;
+                            end
                         end
-                    end
-                    3'b011: begin
-                        if (if_id_instr[31:25] == 7'b0000000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_SLTU;
+                        3'b010: begin
+                            if (if_id_instr[31:25] == 7'b0000000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_SLT;
+                            end
                         end
-                    end
-                    3'b100: begin
-                        if (if_id_instr[31:25] == 7'b0000000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_XOR;
+                        3'b011: begin
+                            if (if_id_instr[31:25] == 7'b0000000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_SLTU;
+                            end
                         end
-                    end
-                    3'b101: begin
-                        if (if_id_instr[31:25] == 7'b0000000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_SRL;
-                        end else if (if_id_instr[31:25] == 7'b0100000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_SRA;
+                        3'b100: begin
+                            if (if_id_instr[31:25] == 7'b0000000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_XOR;
+                            end
                         end
-                    end
-                    3'b110: begin
-                        if (if_id_instr[31:25] == 7'b0000000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_OR;
+                        3'b101: begin
+                            if (if_id_instr[31:25] == 7'b0000000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_SRL;
+                            end else if (if_id_instr[31:25] == 7'b0100000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_SRA;
+                            end
                         end
-                    end
-                    3'b111: begin
-                        if (if_id_instr[31:25] == 7'b0000000) begin
-                            dec_valid  = 1'b1;
-                            dec_alu_op = ALU_AND;
+                        3'b110: begin
+                            if (if_id_instr[31:25] == 7'b0000000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_OR;
+                            end
                         end
-                    end
-                    default: dec_valid = 1'b0;
-                endcase
+                        3'b111: begin
+                            if (if_id_instr[31:25] == 7'b0000000) begin
+                                dec_valid  = 1'b1;
+                                dec_alu_op = ALU_AND;
+                            end
+                        end
+                        default: dec_valid = 1'b0;
+                    endcase
+                end
             end
 
             7'b0010011: begin // I-type算术指令
@@ -327,6 +358,13 @@ module ID_stage (
             id_ex_branch_type <= 3'b0;
             id_ex_jump_type   <= JUMP_NONE;
             id_ex_wb_sel      <= WB_ALU;
+            id_ex_is_mul      <= 1'b0;
+            id_ex_mul_op      <= 2'b0;
+            id_ex_is_div      <= 1'b0;
+            id_ex_div_op      <= 2'b0;
+            id_ex_predicted_taken   <= 1'b0;
+            id_ex_predicted_target  <= 32'b0;
+            id_ex_predicted_next_pc <= 32'b0;
         end else begin
             if (wb_reg_write && (wb_rd != 5'b0))
                 regs[wb_rd] <= wb_data;
@@ -353,6 +391,16 @@ module ID_stage (
                 id_ex_branch_type <= 3'b0;
                 id_ex_jump_type   <= JUMP_NONE;
                 id_ex_wb_sel      <= WB_ALU;
+                id_ex_is_mul      <= 1'b0;
+                id_ex_mul_op      <= 2'b0;
+                id_ex_is_div      <= 1'b0;
+                id_ex_div_op      <= 2'b0;
+                id_ex_predicted_taken   <= 1'b0;
+                id_ex_predicted_target  <= 32'b0;
+                id_ex_predicted_next_pc <= 32'b0;
+            end else if (divider_stall) begin
+                // 多周期除法期间保持EX中的指令上下文
+                id_ex_valid <= id_ex_valid;
             end else if (stall) begin
                 id_ex_valid       <= 1'b0;
                 id_ex_pc          <= 32'b0;
@@ -373,6 +421,13 @@ module ID_stage (
                 id_ex_branch_type <= 3'b0;
                 id_ex_jump_type   <= JUMP_NONE;
                 id_ex_wb_sel      <= WB_ALU;
+                id_ex_is_mul      <= 1'b0;
+                id_ex_mul_op      <= 2'b0;
+                id_ex_is_div      <= 1'b0;
+                id_ex_div_op      <= 2'b0;
+                id_ex_predicted_taken   <= 1'b0;
+                id_ex_predicted_target  <= 32'b0;
+                id_ex_predicted_next_pc <= 32'b0;
             end else begin
                 id_ex_valid       <= if_id_valid && dec_valid;
                 id_ex_pc          <= if_id_pc;
@@ -394,6 +449,13 @@ module ID_stage (
                 id_ex_jump_type   <= (if_id_valid && dec_valid) ?
                                      dec_jump_type : JUMP_NONE;
                 id_ex_wb_sel      <= dec_wb_sel;
+                id_ex_is_mul      <= if_id_valid && dec_valid && dec_is_mul;
+                id_ex_mul_op      <= dec_mul_op;
+                id_ex_is_div      <= if_id_valid && dec_valid && dec_is_div;
+                id_ex_div_op      <= dec_div_op;
+                id_ex_predicted_taken   <= if_id_predicted_taken;
+                id_ex_predicted_target  <= if_id_predicted_target;
+                id_ex_predicted_next_pc <= if_id_predicted_next_pc;
             end
         end
     end

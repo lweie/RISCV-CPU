@@ -1,8 +1,8 @@
-# RV32I五级流水线CPU设计
+# RV32IM五级流水线CPU设计
 
-本项目实现了一个使用纯Verilog-2001编写的32位RISC-V处理器核心。处理器采用经典的IF（取指）→ ID（译码）→ EX（执行）→ MEM（访存）→ WB（写回）五级流水线，并实现数据前递、load-use暂停以及分支跳转冲刷。
+本项目实现了一个使用纯Verilog-2001编写的32位RISC-V处理器核心。处理器采用经典的IF（取指）→ ID（译码）→ EX（执行）→ MEM（访存）→ WB（写回）五级流水线，在原有RV32I基础上增加了完整RV32M整数乘除法、64项BHT+BTB动态分支预测和误预测恢复。
 
-当前版本以RV32I普通整数指令和基础流水线控制为核心，采用Harvard结构，指令存储器与数据存储器接口相互独立。项目暂不包含Cache、MMU、CSR、中断、总线握手和动态分支预测等系统级功能。
+当前设计采用Harvard结构，Instruction Memory与Data Memory接口相互独立。项目以清晰的流水线数据通路和控制逻辑为重点，暂不包含Cache、MMU、CSR、中断和外部总线握手等系统级功能。
 
 ---
 
@@ -10,81 +10,162 @@
 
 ### 1. 五级流水线
 
-- **IF阶段**：维护PC、完成取指和next PC选择，并保存IF/ID流水寄存器
-- **ID阶段**：完成指令译码、寄存器读取、立即数生成和控制信号生成
-- **EX阶段**：完成ALU运算、数据前递、分支比较和跳转目标计算
-- **MEM阶段**：完成Load/Store数据选择、扩展和byte enable生成
+- **IF阶段**：维护PC、查询分支预测器、完成取指并保存IF/ID流水寄存器
+- **ID阶段**：完成指令译码、寄存器读取、立即数生成和冒险检测
+- **EX阶段**：完成Forwarding、ALU、乘除法控制和真实控制流解析
+- **MEM阶段**：完成Load/Store访问、数据扩展和byte enable生成
 - **WB阶段**：在ALU结果、Load结果和PC + 4之间选择写回数据
+
+仍然保留四组流水寄存器：
+
+```text
+IF/ID -> ID/EX -> EX/MEM -> MEM/WB
+```
 
 ### 2. 数据冒险处理
 
 - 实现EX/MEM → EX前递
 - 实现MEM/WB → EX前递
 - EX/MEM前递优先级高于MEM/WB
-- 前递后的操作数同时用于ALU、Branch比较、Store data和JALR目标计算
-- Register File包含WB → ID同周期旁路，避免写回与读取同周期产生旧值
+- `reg_write`有效且`rd != x0`时才允许前递
+- 前递结果用于ALU、Multiplier、Divider、Branch、Store data和JALR
+- Register File包含WB → ID同周期旁路
 - x0始终读取为0，并禁止写入
 
 ### 3. Load-use暂停
 
-ID阶段根据当前指令的`uses_rs1`和`uses_rs2`进行有效源寄存器判断。当ID/EX中的Load目标寄存器被当前ID指令使用时：
+ID阶段根据`uses_rs1`和`uses_rs2`判断当前指令是否真正使用源寄存器。当ID/EX中的Load目标寄存器产生相关时：
 
-1. PC保持不变
-2. IF/ID流水寄存器保持不变
-3. ID/EX流水寄存器插入bubble
-4. Load继续向EX/MEM和MEM/WB推进
+1. PC保持
+2. IF/ID保持
+3. ID/EX插入bubble
+4. Load继续向后续流水级推进
 
-该检测不会因为LUI、JAL等不使用源寄存器的指令位域而产生虚假暂停。
+LUI、JAL等不使用对应源寄存器的指令不会产生虚假暂停。
 
-### 4. 控制冒险处理
+### 4. Divider暂停
 
-当前采用Predict Not Taken策略。Branch、JAL和JALR均在EX阶段确定是否重定向PC：
+DIV、DIVU、REM和REMU在EX阶段启动多周期Divider。运算期间：
 
-- taken Branch：`redirect_pc = PC + B-immediate`
-- JAL：`redirect_pc = PC + J-immediate`
-- JALR：`redirect_pc = (rs1 + I-immediate) & 32'hffff_fffe`
+- PC和IF/ID保持
+- ID/EX保持当前除法指令上下文
+- EX/MEM在等待周期写入bubble，防止旧指令重复提交
+- Divider完成时，结果只进入EX/MEM一次
+- 流水线随后恢复正常推进
 
-发生重定向时，IF/ID和ID/EX中的年轻指令被置为无效。控制优先级为：
+`start`只在Divider空闲且当前EX指令为新的除法指令时有效。`busy`表示迭代计算进行中，`done`是结果完成事件。
+
+### 5. 全局控制优先级
 
 ```text
-reset > EX redirect / flush > load-use stall > normal advance
+reset
+  > branch/jump misprediction redirect + flush
+  > divider stall
+  > load-use stall
+  > normal pipeline advance
 ```
+
+误预测恢复不会被普通Stall阻止。
 
 ---
 
-## 🔧 RV32I指令支持
+## 🔧 指令集支持
 
-### R-Type
+### RV32I
 
-- ADD、SUB
-- SLL、SLT、SLTU
-- XOR、SRL、SRA
-- OR、AND
+| 类型 | 指令 |
+| --- | --- |
+| R-Type | ADD、SUB、SLL、SLT、SLTU、XOR、SRL、SRA、OR、AND |
+| I-Type | ADDI、SLTI、SLTIU、XORI、ORI、ANDI、SLLI、SRLI、SRAI |
+| Load | LB、LH、LW、LBU、LHU |
+| Store | SB、SH、SW |
+| Branch | BEQ、BNE、BLT、BGE、BLTU、BGEU |
+| Jump | JAL、JALR |
+| Upper Immediate | LUI、AUIPC |
 
-### I-Type算术指令
+### RV32M
 
-- ADDI、SLTI、SLTIU
-- XORI、ORI、ANDI
-- SLLI、SRLI、SRAI
+| 类型 | 指令 | 实现方式 |
+| --- | --- | --- |
+| Multiply | MUL、MULH、MULHSU、MULHU | 单周期组合乘法器 |
+| Divide | DIV、DIVU、REM、REMU | 32轮多周期恢复除法器 |
 
-### Load / Store
+Multiplier使用64位乘积：
 
-- Load：LB、LH、LW、LBU、LHU
-- Store：SB、SH、SW
+- MUL取低32位
+- MULH执行signed × signed并取高32位
+- MULHSU执行signed × unsigned并取高32位
+- MULHU执行unsigned × unsigned并取高32位
 
-MEM阶段根据地址低两位选择byte lane，并对Load结果进行符号扩展或零扩展。Store通过`dmem_wstrb[3:0]`给出有效字节掩码。
+实现中先显式计算操作数绝对值，再根据操作类型恢复64位乘积符号，避免Verilog signed/unsigned表达式自动转换造成高位错误。
 
-### Branch / Jump
+Divider处理RV32M规定的特殊情况：
 
-- Branch：BEQ、BNE、BLT、BGE、BLTU、BGEU
-- Jump：JAL、JALR
+- DIV/DIVU除数为0时返回`32'hffff_ffff`
+- REM/REMU除数为0时返回原dividend
+- `32'h8000_0000 / 32'hffff_ffff`时，DIV返回`32'h8000_0000`
+- 对应REM返回`32'h0000_0000`
 
-有符号比较使用`$signed(...)`，无符号比较保持普通32位比较。JAL和JALR均将PC + 4写入rd。
+---
 
-### Upper Immediate
+## 🎯 动态分支预测
 
-- LUI
-- AUIPC
+### BHT
+
+- 64项Branch History Table
+- 使用`PC[7:2]`作为Index
+- 每项为2-bit饱和计数器
+- Reset后初始化为`01`（Weakly Not Taken）
+- 使用计数器最高位作为Taken/Not Taken预测
+
+条件分支在EX阶段得到真实结果后更新BHT：
+
+```text
+actual taken     -> counter + 1，最大为11
+actual not taken -> counter - 1，最小为00
+```
+
+### BTB
+
+- 64项Direct-Mapped Branch Target Buffer
+- Index：`PC[7:2]`
+- Tag：`PC[31:8]`
+- 每项保存valid、tag和target PC
+- BTB查询同时检查Index和Tag
+- Taken Branch、JAL和JALR在EX解析后更新BTB
+
+### Jump预测策略
+
+- JAL在IF阶段根据完整指令立即数静态预测Taken
+- JALR在BTB命中时预测Taken并使用BTB target
+- JALR未命中时预测PC + 4
+- 当前不包含Return Address Stack
+
+### Prediction Metadata
+
+IF/ID和ID/EX保存：
+
+- `predicted_taken`
+- `predicted_target`
+- `predicted_next_pc`
+
+这些信息与对应指令一起到达EX，避免使用当前IF预测结果判断另一条已进入EX的指令。
+
+### Misprediction Recovery
+
+EX阶段计算：
+
+```text
+actual_next_pc = actual_taken ? actual_target : ex_pc + 4
+mispredict     = predicted_next_pc != actual_next_pc
+```
+
+该比较能够同时检测方向预测错误和目标地址预测错误：
+
+- 预测正确：不Flush
+- 预测错误：redirect到`actual_next_pc`
+- IF/ID和ID/EX中的错误路径指令被置为无效
+- 错误路径指令不能写Register File或Data Memory
 
 ---
 
@@ -92,17 +173,20 @@ MEM阶段根据地址低两位选择byte lane，并对Load结果进行符号扩�
 
 ```text
 RISCV-CPU/
-├── README.md           # 项目说明
+├── README.md                # 项目说明
 └── src/
-    ├── core.v          # CPU顶层和五级流水连接
-    ├── IF.v            # PC与IF/ID流水寄存器
-    ├── ID.v            # Decoder、Register File与ID/EX流水寄存器
-    ├── EX.v            # Forwarding、ALU、Branch/Jump与EX/MEM流水寄存器
-    ├── MEM.v           # Data Memory访问与MEM/WB流水寄存器
-    └── WB.v            # Writeback数据选择
+    ├── core.v               # CPU顶层和结构级连接
+    ├── IF.v                 # PC、预测next PC和IF/ID流水寄存器
+    ├── ID.v                 # Decoder、Register File和ID/EX流水寄存器
+    ├── EX.v                 # Forwarding、RV32M控制和控制流解析
+    ├── MEM.v                # Data Memory访问和MEM/WB流水寄存器
+    ├── WB.v                 # Writeback数据选择
+    ├── multiplier.v         # RV32M组合乘法器
+    ├── divider.v            # RV32M多周期迭代除法器
+    └── branch_predictor.v   # 64项BHT和BTB
 ```
 
-`core.v`只负责结构级连接，不包含完整Decoder、ALU、Register File或Immediate Generator实现。
+`core.v`只负责实例化和信号连接。Multiplier、Divider和Branch Predictor的核心逻辑均保留在独立RTL文件中。
 
 ---
 
@@ -110,44 +194,42 @@ RISCV-CPU/
 
 ### IF/ID
 
-- `valid`
-- `PC`
-- `instruction`
+- `valid`、PC、instruction
+- predicted taken
+- predicted target
+- predicted next PC
 
 ### ID/EX
 
-- `valid`、`PC`
-- rs1/rs2寄存器值与索引
-- rd索引和immediate
-- ALU操作及操作数选择
-- Register File写使能
-- Load/Store控制和访问类型
-- Branch/Jump控制
-- Writeback选择
+- `valid`、PC
+- rs1/rs2寄存器值与索引、rd
+- immediate
+- ALU操作和操作数选择
+- Load/Store、Branch/Jump和Writeback控制
+- RV32M操作类型
+- Prediction Metadata
 
 ### EX/MEM
 
 - `valid`、rd
-- ALU结果和Store data
+- ALU或RV32M结果
+- Store data
 - PC + 4
-- Register File写使能
-- Load/Store控制和访问类型
-- Writeback选择
+- Register File、Memory和Writeback控制
 
 ### MEM/WB
 
 - `valid`、rd
-- ALU结果
+- ALU/RV32M结果
 - Load结果
 - PC + 4
-- Register File写使能
-- Writeback选择
+- Register File和Writeback控制
 
 ---
 
 ## 🔌 顶层接口
 
-顶层模块为`core`，使用分离的Instruction Memory和Data Memory接口：
+顶层模块仍为`core`，外部接口保持不变：
 
 ```verilog
 module core (
@@ -164,9 +246,103 @@ module core (
 );
 ```
 
-当前接口不包含`valid`、`ready`或可变等待周期握手，默认指令和数据存储器能够在当前访问周期提供结果。
+接口不包含`valid`、`ready`或可变等待周期握手。Instruction Memory和Data Memory仍按固定时序、零等待模型工作。
 
-Reset为高有效同步复位。复位时PC清零，所有pipeline valid和可能产生副作用的流水控制状态失效。
+Reset为高有效同步复位。复位时PC、Pipeline valid、Divider状态、BHT和BTB均回到初始状态。
 
 ---
-当前项目保持为一个结构清晰、功能范围明确的RV32I五级流水线CPU基础实现，便于继续进行验证和后续功能扩展。
+
+## ✅ 当前实现进度
+
+### 已完成
+
+- ✅ RV32I五级流水线
+- ✅ 完整RV32M整数乘除法指令
+- ✅ EX/MEM和MEM/WB Forwarding
+- ✅ Forwarding覆盖ALU、MUL、DIV、Store、Branch和JALR
+- ✅ Load-use Stall和bubble插入
+- ✅ Divider Stall及一次性start/done交接
+- ✅ 64项2-bit BHT
+- ✅ 64项带Tag的Direct-Mapped BTB
+- ✅ JAL静态预测和JALR BTB预测
+- ✅ Prediction Metadata随指令传递
+- ✅ EX真实控制流解析
+- ✅ 仅在Misprediction时Redirect和Flush
+- ✅ Load符号/零扩展和Store byte enable
+- ✅ x0保护和同步Reset
+
+### 已执行检查
+
+- Icarus Verilog Verilog-2001编译检查
+- Verilator Verilog-2001 lint
+- 禁止的SystemVerilog关键字扫描
+- MUL、MULH、MULHSU、MULHU定向运算检查
+- DIV、DIVU、REM、REMU定向运算检查
+- Division by zero和`INT_MIN / -1`检查
+- BHT状态更新、BTB Tag alias和JAL预测检查
+
+基础编译命令：
+
+```bash
+iverilog -g2001 -Wall -s core -tnull \
+  src/core.v src/IF.v src/ID.v src/EX.v src/MEM.v src/WB.v \
+  src/multiplier.v src/divider.v src/branch_predictor.v
+```
+
+---
+
+## 🧪 建议的后续Testbench场景
+
+### RV32M和Forwarding
+
+1. `add -> mul`：验证ALU结果前递到Multiplier
+2. `mul -> add`：验证乘法结果从EX/MEM前递
+3. `add -> div`：验证前递后的操作数进入Divider
+4. `div -> add`：验证Divider Stall和完成后的结果依赖
+5. DIV/REM除数为0
+6. `INT_MIN / -1`
+7. 连续两条DIV/REM
+8. `mul/div -> store、branch、jalr`
+
+### Branch Predictor
+
+1. 连续Taken Branch
+2. 连续Not Taken Branch
+3. Taken/Not Taken交替
+4. 同一Branch循环执行，观察2-bit计数器学习
+5. BTB Index相同但Tag不同
+6. 方向预测正确
+7. 方向预测错误
+8. 方向正确但BTB target错误
+9. `add -> branch` Forwarding
+10. `load -> branch` Load-use Stall
+11. JAL静态预测
+12. JALR首次未命中和后续BTB命中
+
+---
+
+## ⚠️ 当前限制
+
+- 不支持FENCE、ECALL、EBREAK和CSR指令
+- 不支持A/F/D/C/V等扩展
+- 不包含异常、中断和特权级处理
+- 不包含UART、AXI、Wishbone、MMU、TLB和Cache
+- 分支预测器不包含RAS、GShare、Tournament或TAGE
+- 不处理非法指令异常，未支持编码作为无效流水项处理
+- 没有非对齐访问异常或跨32位边界拆分机制，LH/LW/SH/SW应自然对齐
+- Memory接口不支持wait state
+- Divider固定执行32轮迭代，当前没有提前结束优化
+- 当前验证以静态检查和运算单元定向检查为主，仍建议增加完整CPU程序级Testbench或差分测试
+
+---
+
+## 🎯 后续优化方向
+
+1. 建立RV32IM指令级Testbench和Memory Model
+2. 增加RISC-V汇编测试与参考模型比对
+3. 统计BHT/BTB命中率和Misprediction率
+4. 为Divider增加前导零检测或提前结束
+5. 在保持正确性的前提下评估更大的Predictor或RAS
+6. 完成综合、资源占用和时序检查
+
+当前项目保持经典五级流水结构，在不改变外部Memory接口的情况下完成了RV32M、多周期执行控制和第一版动态分支预测扩展。
