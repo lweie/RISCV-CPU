@@ -2,7 +2,7 @@
 
 本项目实现了一个使用纯Verilog-2001编写的32位RISC-V处理器核心。处理器采用经典的IF（取指）→ ID（译码）→ EX（执行）→ MEM（访存）→ WB（写回）五级流水线，在原有RV32I基础上增加了完整RV32M整数乘除法、64项BHT+BTB动态分支预测和误预测恢复。
 
-当前设计采用Harvard结构，Instruction Memory与Data Memory接口相互独立。项目以清晰的流水线数据通路和控制逻辑为重点，暂不包含Cache、MMU、CSR、中断和外部总线握手等系统级功能。
+`core`内部继续采用分离的Instruction Memory和Data Memory接口；新增的`src/soc`层将两者接入统一Main RAM，并对Data Port完成MMIO地址译码。当前SoC不包含Cache、MMU、CSR、中断和外部总线握手，UART、Timer、Keyboard与VGA仅预留地址窗口。
 
 ---
 
@@ -174,19 +174,33 @@ mispredict     = predicted_next_pc != actual_next_pc
 ```text
 RISCV-CPU/
 ├── README.md                # 项目说明
-└── src/
-    ├── core.v               # CPU顶层和结构级连接
-    ├── IF.v                 # PC、预测next PC和IF/ID流水寄存器
-    ├── ID.v                 # Decoder、Register File和ID/EX流水寄存器
-    ├── EX.v                 # Forwarding、RV32M控制和控制流解析
-    ├── MEM.v                # Data Memory访问和MEM/WB流水寄存器
-    ├── WB.v                 # Writeback数据选择
-    ├── multiplier.v         # RV32M组合乘法器
-    ├── divider.v            # RV32M多周期迭代除法器
-    └── branch_predictor.v   # 64项BHT和BTB
+├── src/
+│   ├── soc/
+│   │   ├── memory_map.vh    # RTL地址映射
+│   │   ├── mmio_interconnect.v # Data Port地址译码和读数据选择
+│   │   ├── main_memory.v    # IF/Data共享的64 KiB Main RAM
+│   │   └── soc_top.v        # CPU、Main RAM和Interconnect顶层
+│   │
+│   ├── core.v               # CPU顶层和结构级连接
+│   ├── IF.v                 # PC、预测next PC和IF/ID流水寄存器
+│   ├── ID.v                 # Decoder、Register File和ID/EX流水寄存器
+│   ├── EX.v                 # Forwarding、RV32M控制和控制流解析
+│   ├── MEM.v                # Data Memory访问和MEM/WB流水寄存器
+│   ├── WB.v                 # Writeback数据选择
+│   ├── multiplier.v         # RV32M组合乘法器
+│   ├── divider.v            # RV32M多周期迭代除法器
+│   └── branch_predictor.v   # 64项BHT和BTB
+└── software/
+    ├── Makefile             # RV32IM裸机构建入口
+    ├── linker.ld            # 64 KiB RAM链接布局
+    ├── start.S              # Reset入口和最小启动代码
+    ├── main.c               # 最小C程序
+    ├── include/mmio.h       # 软件侧MMIO地址定义
+    ├── scripts/bin2hex.py   # BIN转readmemh HEX
+    └── README.md            # 软件构建和加载说明
 ```
 
-`core.v`只负责实例化和信号连接。Multiplier、Divider和Branch Predictor的核心逻辑均保留在独立RTL文件中。
+`core.v`只负责CPU内部实例化和信号连接。SoC地址译码、统一主存和软件构建均位于独立目录，不把系统逻辑重新写入流水级。
 
 ---
 
@@ -229,7 +243,7 @@ RISCV-CPU/
 
 ## 🔌 顶层接口
 
-顶层模块仍为`core`，外部接口保持不变：
+CPU顶层模块仍为`core`，Data Port增加`dmem_valid`访问指示：
 
 ```verilog
 module core (
@@ -239,6 +253,7 @@ module core (
     output wire [31:0] imem_addr,
     input  wire [31:0] imem_rdata,
 
+    output wire        dmem_valid,
     output wire [31:0] dmem_addr,
     output wire [31:0] dmem_wdata,
     output wire [3:0]  dmem_wstrb,
@@ -246,9 +261,68 @@ module core (
 );
 ```
 
-接口不包含`valid`、`ready`或可变等待周期握手。Instruction Memory和Data Memory仍按固定时序、零等待模型工作。
+`dmem_valid`仅在MEM阶段存在有效Load或Store时拉高。`dmem_wstrb != 0`表示写访问，`dmem_valid && dmem_wstrb == 0`表示读访问；接口没有`ready`，仍按固定时序、零等待模型工作。
+
+可直接集成的系统顶层为`soc_top`：
+
+```text
+core
+  ├── Instruction Port ──────────────┐
+  └── Data Port ── MMIO Interconnect ├── Main RAM
+                       ├──────────────┴── UART window
+                       ├───────────────── Timer window
+                       ├───────────────── Keyboard window
+                       ├───────────────── VGA CTRL window
+                       └───────────────── VGA FB window
+```
+
+Instruction Port和RAM Data Port访问`main_memory.v`中的同一数组。外设窗口当前只输出Select及共享的地址、写数据和byte strobe，读数据固定为0，写入不产生副作用。
 
 Reset为高有效同步复位。复位时PC、Pipeline valid、Divider状态、BHT和BTB均回到初始状态。
+
+---
+
+## 🗺️ SoC Memory Map
+
+| 区域 | 起始地址 | 结束地址 | 大小 | 当前状态 |
+| --- | --- | --- | --- | --- |
+| Main RAM | `0x0000_0000` | `0x0000_FFFF` | 64 KiB | 已实现 |
+| UART | `0x1000_0000` | `0x1000_0FFF` | 4 KiB | 仅预留译码 |
+| Timer | `0x1000_1000` | `0x1000_1FFF` | 4 KiB | 仅预留译码 |
+| Keyboard | `0x1000_2000` | `0x1000_2FFF` | 4 KiB | 仅预留译码 |
+| VGA CTRL | `0x1000_3000` | `0x1000_3FFF` | 4 KiB | 仅预留译码 |
+| VGA Framebuffer | `0x2000_0000` | `0x2001_FFFF` | 128 KiB | 仅预留译码 |
+
+RTL地址常量集中在`src/soc/memory_map.vh`，软件侧镜像位于`software/include/mmio.h`。修改地址映射时应同时更新两处。未映射地址读取返回0，写入不选中任何Slave。
+
+---
+
+## 💻 Bare-metal软件
+
+`software/`使用RISC-V GCC交叉工具链把C和启动汇编链接到地址`0x0000_0000`。默认编译选项与当前硬件一致：
+
+```text
+-march=rv32im -mabi=ilp32
+```
+
+构建命令：
+
+```bash
+cd software
+make
+```
+
+输出包括`program.elf`、`program.bin`、`program.hex`、`program.dump`和`program.map`。`start.S`设置栈顶、清零`.bss`并调用`main`；工程不依赖操作系统、标准C运行库或CSR。
+
+仿真时将HEX传给SoC顶层：
+
+```verilog
+soc_top #(
+    .MEM_INIT_FILE("software/build/program.hex")
+) dut (...);
+```
+
+HEX每行保存一个little-endian 32位word，可由`main_memory.v`的`$readmemh`直接加载。详细工具链配置和文件说明见`software/README.md`。
 
 ---
 
@@ -270,6 +344,11 @@ Reset为高有效同步复位。复位时PC、Pipeline valid、Divider状态、B
 - ✅ 仅在Misprediction时Redirect和Flush
 - ✅ Load符号/零扩展和Store byte enable
 - ✅ x0保护和同步Reset
+- ✅ Data Port有效访问指示`dmem_valid`
+- ✅ 统一Memory Map和MMIO Interconnect
+- ✅ 64 KiB IF/Data共享Main RAM
+- ✅ UART、Timer、Keyboard和VGA地址窗口预留
+- ✅ RV32IM Bare-metal C启动、链接和HEX转换环境
 
 ### 已执行检查
 
@@ -280,6 +359,11 @@ Reset为高有效同步复位。复位时PC、Pipeline valid、Divider状态、B
 - DIV、DIVU、REM、REMU定向运算检查
 - Division by zero和`INT_MIN / -1`检查
 - BHT状态更新、BTB Tag alias和JAL预测检查
+- SoC顶层Icarus Verilog编译和Verilator lint
+- MMIO各地址窗口边界、Select互斥和Read Data Mux检查
+- `dmem_valid`有效项门控和Store byte strobe透传检查
+- Main RAM整字、单字节、半字写入以及IF/Data共享读取检查
+- RTL/C Memory Map一致性和BIN转HEX little-endian/补零检查
 
 基础编译命令：
 
@@ -326,23 +410,27 @@ iverilog -g2001 -Wall -s core -tnull \
 - 不支持FENCE、ECALL、EBREAK和CSR指令
 - 不支持A/F/D/C/V等扩展
 - 不包含异常、中断和特权级处理
-- 不包含UART、AXI、Wishbone、MMU、TLB和Cache
+- UART、Timer、Keyboard和VGA尚未实现实际寄存器或存储，仅完成地址译码
+- 不包含AXI、Wishbone、MMU、TLB和Cache
 - 分支预测器不包含RAS、GShare、Tournament或TAGE
 - 不处理非法指令异常，未支持编码作为无效流水项处理
 - 没有非对齐访问异常或跨32位边界拆分机制，LH/LW/SH/SW应自然对齐
 - Memory接口不支持wait state
+- 当前Main RAM采用组合读、同步byte write，以匹配Core的固定零等待时序；映射到特定FPGA同步Block RAM时可能需要调整CPU/Memory时序
+- Instruction Port只从Main RAM取指，不允许从MMIO区域执行代码
 - Divider固定执行32轮迭代，当前没有提前结束优化
-- 当前验证以静态检查和运算单元定向检查为主，仍建议增加完整CPU程序级Testbench或差分测试
+- Bare-metal构建需要另行安装`riscv32-unknown-elf-`或兼容的RISC-V GCC工具链
+- 当前仍缺少完整SoC程序级Testbench、外设模型和差分测试
 
 ---
 
 ## 🎯 后续优化方向
 
-1. 建立RV32IM指令级Testbench和Memory Model
-2. 增加RISC-V汇编测试与参考模型比对
-3. 统计BHT/BTB命中率和Misprediction率
-4. 为Divider增加前导零检测或提前结束
-5. 在保持正确性的前提下评估更大的Predictor或RAS
-6. 完成综合、资源占用和时序检查
+1. 建立能够加载`program.hex`的SoC程序级Testbench
+2. 在预留Select端口后接入UART、Timer、Keyboard和VGA Slave
+3. 增加RISC-V汇编测试与参考模型比对
+4. 统计BHT/BTB命中率和Misprediction率
+5. 为Divider增加前导零检测或提前结束
+6. 完成FPGA RAM适配、综合、资源占用和时序检查
 
-当前项目保持经典五级流水结构，在不改变外部Memory接口的情况下完成了RV32M、多周期执行控制和第一版动态分支预测扩展。
+当前项目保持经典五级流水CPU边界，在Core之外完成了统一Main RAM、MMIO地址空间和Bare-metal C构建链路，为后续逐个接入实际外设提供了稳定接口。

@@ -21,6 +21,7 @@ obj_dir/
 
 # C/C++ build files
 build/
+software/build/
 *.o
 *.elf
 *.bin

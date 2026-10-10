@@ -6,6 +6,7 @@ module core (
     output wire [31:0] imem_addr,
     input  wire [31:0] imem_rdata,
 
+    output wire        dmem_valid,
     output wire [31:0] dmem_addr,
     output wire [31:0] dmem_wdata,
     output wire [3:0]  dmem_wstrb,
@@ -299,6 +300,7 @@ module core (
         .dmem_addr          (dmem_addr),
         .dmem_wdata         (dmem_wdata),
         .dmem_wstrb         (dmem_wstrb),
+        .dmem_valid         (dmem_valid),
         .dmem_rdata         (dmem_rdata),
         .mem_wb_valid       (mem_wb_valid),
         .mem_wb_rd          (mem_wb_rd),

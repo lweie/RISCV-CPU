@@ -14,6 +14,7 @@ module MEM_stage (
     input  wire [2:0]  ex_mem_mem_type,
     input  wire [1:0]  ex_mem_wb_sel,
 
+    output wire        dmem_valid,
     output wire [31:0] dmem_addr,
     output reg  [31:0] dmem_wdata,
     output reg  [3:0]  dmem_wstrb,
@@ -33,6 +34,8 @@ module MEM_stage (
     wire [4:0]  byte_shift;
 
     assign dmem_addr = ex_mem_alu_result;
+    assign dmem_valid = ex_mem_valid &&
+                        (ex_mem_mem_read || ex_mem_mem_write);
     assign byte_shift = {ex_mem_alu_result[1:0], 3'b000};
 
     // 地址低两位选择写数据所在的byte lane
